@@ -20,7 +20,7 @@
 readonly VERSION="3.4.10"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://gitlab.com/chil30-group/vless-all-in-one"
-readonly SCRIPT_REPO="chil30-group/vless-all-in-one"local pubkey=$(echo "$keys"
+readonly SCRIPT_REPO="chil30-group/vless-all-in-one"
 readonly SCRIPT_RAW_URL="https://gitlab.com/chil30-group/vless-all-in-one/-/raw/main/vless-server.sh"
 readonly CFG="/etc/vless-reality"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
