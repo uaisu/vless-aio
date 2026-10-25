@@ -23,7 +23,7 @@ readonly REPO_URL="https://gitlab.com/chil30-group/vless-all-in-one"
 readonly SCRIPT_REPO="chil30-group/vless-all-in-one"
 readonly SCRIPT_RAW_URL="https://gitlab.com/chil30-group/vless-all-in-one/-/raw/main/vless-server.sh"
 readonly CFG="/etc/vless-reality"
-readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
+readonly ACME_DEFAULT_EMAIL="admin@example.com"
 
 # curl 超时常量
 readonly CURL_TIMEOUT_FAST=5
@@ -98,6 +98,109 @@ _db_apply() { # _db_apply [jq args...] 'filter'
     fi
     rm -f "$tmp"
     return 1
+}
+
+# 原子安全写数据库（防止并发/失败写坏 db.json 导致用户列表被清空）
+# 用法: _db_safe_write <allow_wipe:0|1> <guard-core> [jq args...] 'filter'
+#   allow_wipe=1 表示本次操作本身就是“删除/替换”，允许 users 数组合法地被清空
+#               （例如 db_del_user 删最后一个用户、db_remove_port 删端口）；
+#               allow_wipe=0 时若守卫 key 下用户数从 >0 变成 0，判定为
+#               “异常清空”，拒绝写入并返回 2。
+#   guard-core  形如 "xray.vless"（多个用空格隔开），留空则不做清空护栏。
+# 返回: 0=成功; 1=jq 失败/锁失败; 2=命中清空护栏。
+# 关键设计:
+#   1) 用 mkdir 原子目录锁串行化并发写（比共享 ${DB_FILE}.tmp 安全，防丢更新）；
+#   2) mktemp 生成唯一临时文件，只有 jq 成功才 mv，杜绝空/半成品覆盖 db.json；
+#   3) 同目录 mv 是原子替换，崩溃时不会留下坏库。
+_db_safe_write() {
+    local allow_wipe="$1" guard_core="$2"
+    shift 2
+    [[ -f "$DB_FILE" ]] || init_db || return 1
+
+    # 便携互斥锁：mkdir 是原子的；最多等 5 秒
+    local lock_dir="${DB_FILE}.lock"
+    local locked=0
+    for _ in $(seq 1 50); do
+        if mkdir "$lock_dir" 2>/dev/null; then locked=1; break; fi
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    if [[ "$locked" != "1" ]]; then
+        _err "数据库写入锁等待超时，已跳过本次写入"
+        return 1
+    fi
+
+    # 计算守卫 key 下写入前的用户总数
+    local before_users=0
+    if [[ -n "$guard_core" ]]; then
+        local g
+        for g in $guard_core; do
+            local n
+            n=$(jq -r --arg g "$g" '
+                (getpath($g | split("."))) as $cfg |
+                if ($cfg | type) == "array" then
+                    ($cfg | map(.users // [] | length) | add) // 0
+                elif ($cfg | type) == "object" then
+                    ($cfg.users // [] | length)
+                else
+                    0
+                end
+            ' "$DB_FILE" 2>/dev/null)
+            n=${n:-0}
+            before_users=$((before_users + n))
+        done
+    fi
+
+    local tmp
+    tmp=$(mktemp "${DB_FILE}.tmp.XXXXXX") || { rmdir "$lock_dir" 2>/dev/null; return 1; }
+
+    if ! jq "$@" "$DB_FILE" >"$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        rmdir "$lock_dir" 2>/dev/null
+        return 1
+    fi
+    # jq 空输出（例如 db.json 被并发置空）也算失败
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        rmdir "$lock_dir" 2>/dev/null
+        _err "数据库写入产生空结果，已中止"
+        return 1
+    fi
+
+    # 清空护栏：之前有用户、本次又不是显式删除操作，却要把用户变成 0 → 拒绝
+    if [[ "$allow_wipe" != "1" && -n "$guard_core" && "$before_users" -gt 0 ]]; then
+        local after_users=0
+        for g in $guard_core; do
+            local n2
+            n2=$(jq -r --arg g "$g" '
+                (getpath($g | split("."))) as $cfg |
+                if ($cfg | type) == "array" then
+                    ($cfg | map(.users // [] | length) | add) // 0
+                elif ($cfg | type) == "object" then
+                    ($cfg.users // [] | length)
+                else
+                    0
+                end
+            ' "$tmp" 2>/dev/null)
+            n2=${n2:-0}
+            after_users=$((after_users + n2))
+        done
+        if [[ "$after_users" -eq 0 ]]; then
+            rm -f "$tmp"
+            rmdir "$lock_dir" 2>/dev/null
+            _err "检测到用户列表将全部清空，已中止写入（${guard_core}）"
+            return 2
+        fi
+    fi
+
+    local rc=0
+    if mv "$tmp" "$DB_FILE"; then
+        _db_touch 2>/dev/null
+    else
+        rm -f "$tmp"
+        rc=1
+    fi
+    rmdir "$lock_dir" 2>/dev/null
+    return $rc
 }
 
 
@@ -199,9 +302,8 @@ db_add_port() {
         return 0
     fi
     
-    local tmp_file="${DB_FILE}.tmp"
-    
-    jq --arg c "$core" --arg p "$protocol" --argjson cfg "$port_config" '
+    _db_safe_write 0 "${core}.${protocol}" \
+        --arg c "$core" --arg p "$protocol" --argjson cfg "$port_config" '
         .[$c][$p] = (
             if .[$c][$p] then
                 if (.[$c][$p] | type) == "array" then
@@ -213,7 +315,7 @@ db_add_port() {
                 [$cfg]
             end
         )
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
 }
 
 # 删除指定端口实例
@@ -222,9 +324,8 @@ db_remove_port() {
     local core="$1" protocol="$2" port="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    
-    jq --arg c "$core" --arg p "$protocol" --arg port "$port" '
+    _db_safe_write 1 "${core}.${protocol}" \
+        --arg c "$core" --arg p "$protocol" --arg port "$port" '
         .[$c][$p] = (
             if (.[$c][$p] | type) == "array" then
                 .[$c][$p] | map(select(.port != ($port | tonumber)))
@@ -240,7 +341,7 @@ db_remove_port() {
         else
             .
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
 }
 
 # 更新指定端口的配置
@@ -249,9 +350,8 @@ db_update_port() {
     local core="$1" protocol="$2" port="$3" new_config="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    
-    jq --arg c "$core" --arg p "$protocol" --arg port "$port" --argjson cfg "$new_config" '
+    _db_safe_write 1 "${core}.${protocol}" \
+        --arg c "$core" --arg p "$protocol" --arg port "$port" --argjson cfg "$new_config" '
         .[$c][$p] = (
             if (.[$c][$p] | type) == "array" then
                 .[$c][$p] | map(if .port == ($port | tonumber) then $cfg else . end)
@@ -263,7 +363,7 @@ db_update_port() {
                 end
             end
         )
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
 }
 
 # 删除协议
@@ -735,9 +835,9 @@ db_add_user() {
     local created=$(date '+%Y-%m-%d')
     
     # 添加用户 (支持多端口数组，包含 expire_date)
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
-       --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
+        --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             # 多端口: 添加到第一个端口实例
@@ -746,10 +846,11 @@ db_add_user() {
             # 单端口: 正常添加
             .[$c][$p].users = ((.[$c][$p].users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp}])
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || { _err "添加用户失败（数据库写入未完成）"; return 1; }
     
     # 如果设置了到期日期，自动安装过期检查 cron
     [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
+    [[ "$quota_gb" -gt 0 ]] && ensure_traffic_cron 2>/dev/null
     
     # 自动重建配置
     if [[ "$core" == "xray" ]]; then
@@ -766,17 +867,24 @@ db_del_user() {
     local core="$1" proto="$2" name="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" '
+    # 使用原子安全写；护栏防止“删除一个用户却把整个 users 列表清空”的异常。
+    # 多端口分支：只修改真正含有该用户的端口，不往原本没有 users 数组的端口硬塞 users:[]，
+    # 避免破坏“uuid 默认凭证”结构。
+    _db_safe_write 1 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            # 多端口: 从所有端口实例中删除该用户
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | select(.name != $n)])]
+            # 多端口: 仅从含 users 数组的端口里删，保留其它端口原样
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | select(.name != $n)])
+            else
+                .
+            end]
         else
             # 单端口
-            .[$c][$p].users = [.[$c][$p].users // [] | .[] | select(.name != $n)]
+            .[$c][$p].users = ([.[$c][$p].users // [] | .[] | select(.name != $n)])
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || { _err "删除用户失败（数据库写入未完成或被清空护栏拦截）"; return 1; }
     
     # 自动重建配置
     if [[ "$core" == "xray" ]]; then
@@ -905,15 +1013,19 @@ db_update_user_traffic() {
     local core="$1" proto="$2" name="$3" bytes="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .used += $b else . end])]
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .used += $b else . end])
+            else
+                .
+            end]
         else
             .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .used += $b else . end]
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
 }
 
 # 设置用户流量(覆盖) (支持多端口数组格式)
@@ -922,15 +1034,19 @@ db_set_user_traffic() {
     local core="$1" proto="$2" name="$3" bytes="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .used = $b else . end])]
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .used = $b else . end])
+            else
+                .
+            end]
         else
             .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .used = $b else . end]
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
 }
 
 # 重置用户流量
@@ -950,15 +1066,19 @@ db_set_user_quota() {
         quota=$((quota_gb * 1073741824))
     fi
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson q "$quota" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --argjson q "$quota" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .quota = $q else . end])]
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .quota = $q else . end])
+            else
+                .
+            end]
         else
             .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .quota = $q else . end]
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
 }
 
 # 启用/禁用用户 (支持多端口数组格式)
@@ -967,15 +1087,19 @@ db_set_user_enabled() {
     local core="$1" proto="$2" name="$3" enabled="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .enabled = $e else . end])]
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .enabled = $e else . end])
+            else
+                .
+            end]
         else
             .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .enabled = $e else . end]
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
     
     # 自动重建配置
     [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent"
@@ -1026,28 +1150,26 @@ db_set_user_alert_state() {
     local core="$1" proto="$2" name="$3" field="$4" value="$5"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    
     # 根据值类型选择合适的 jq 参数
+    local -a jq_args=( --arg c "$core" --arg p "$proto" --arg n "$name" --arg f "$field" )
     if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
-        jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg f "$field" --argjson v "$value" '
-            .[$c][$p] as $cfg |
-            if ($cfg | type) == "array" then
-                .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .[$f] = $v else . end])]
-            else
-                .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .[$f] = $v else . end]
-            end
-        ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+        jq_args+=( --argjson v "$value" )
     else
-        jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg f "$field" --arg v "$value" '
-            .[$c][$p] as $cfg |
-            if ($cfg | type) == "array" then
-                .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .[$f] = $v else . end])]
-            else
-                .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .[$f] = $v else . end]
-            end
-        ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+        jq_args+=( --arg v "$value" )
     fi
+    
+    _db_safe_write 0 "${core}.${proto}" "${jq_args[@]}" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .[$f] = $v else . end])
+            else
+                .
+            end]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .[$f] = $v else . end]
+        end
+    ' || return 1
 }
 # 设置用户路由 (支持多端口数组格式)
 # 用法: db_set_user_routing "xray" "vless" "用户名" "direct|warp|chain:xxx|balancer:xxx"
@@ -1061,15 +1183,19 @@ db_set_user_routing() {
     local core="$1" proto="$2" name="$3" routing="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg r "$routing" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --arg r "$routing" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .routing = $r else . end])]
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .routing = $r else . end])
+            else
+                .
+            end]
         else
             .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .routing = $r else . end]
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
     
     # 自动重建配置
     if [[ "$core" == "xray" ]]; then
@@ -1125,15 +1251,19 @@ db_set_user_expire_date() {
     # 处理特殊值
     [[ "$expire_date" == "never" ]] && expire_date=""
     
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg e "$expire_date" '
+    _db_safe_write 0 "${core}.${proto}" \
+        --arg c "$core" --arg p "$proto" --arg n "$name" --arg e "$expire_date" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .expire_date = $e else . end])]
+            .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                .users = ([.users[] | if .name == $n then .expire_date = $e else . end])
+            else
+                .
+            end]
         else
             .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .expire_date = $e else . end]
         end
-    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    ' || return 1
     
     # 如果设置了到期日期，自动安装过期检查 cron
     [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
@@ -1384,6 +1514,28 @@ install_expire_check_cron() {
 
 # 确保过期检查 cron 已安装（设置到期日期时自动调用）
 # 返回: 0=已存在, 1=新安装成功, 2=安装失败
+
+# 确保流量统计 cron 已安装（设置流量配额时自动调用）
+ensure_traffic_cron() {
+    local interval="${1:-$(get_traffic_interval)}"
+    local script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    local cron_cmd="*/$interval * * * * $script_path --sync-traffic >/dev/null 2>&1"
+    
+    if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+        echo -e "  ${D}(流量统计定时任务已启用)${NC}"
+        return 0
+    fi
+    
+    if (crontab -l 2>/dev/null; echo "$cron_cmd") | crontab - 2>/dev/null; then
+        echo -e "  ${G}✓ 已自动安装流量统计定时任务 (每${interval}分钟)${NC}"
+        set_traffic_interval "$interval"
+        return 1
+    else
+        echo -e "  ${Y}提示: 流量统计定时任务未安装，可运行: ./vless-server.sh --setup-traffic-cron${NC}"
+        return 2
+    fi
+}
+
 ensure_expire_check_cron() {
     local script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     local cron_cmd="0 3 * * * $script_path --check-expire --notify >/dev/null 2>&1"
@@ -2737,7 +2889,8 @@ generate_xray_config() {
     esac
     
     # 收集所有需要的出口
-    local outbounds="[$direct_outbound, {\"protocol\": \"blackhole\", \"tag\": \"block\"}]"
+    # block / blocked 两个 tag 指向同一个 blackhole，blocked 为兼容别名
+    local outbounds="[$direct_outbound, {\"protocol\": \"blackhole\", \"tag\": \"block\"}, {\"protocol\": \"blackhole\", \"tag\": \"blocked\"}]"
     local routing_rules=""
     local balancers="[]"
     local has_routing=false
@@ -3033,16 +3186,21 @@ generate_xray_config() {
             routing: {domainStrategy: "IPIfNonMatch", rules: [], balancers: $balancers}
         }' > "$CFG/config.json"
 
-        # 添加路由规则（API 规则放最前面）
+        # 添加路由规则（API + 默认拦截规则放最前面）
+        # 默认拦截：私有 IP 段与 BitTorrent 协议一律走 blackhole（tag=block）
+        local default_rules='[
+            {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+            {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+            {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+        ]'
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
-            local api_rule='{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}'
-            local all_rules=$(echo "$routing_rules" | jq --argjson api "$api_rule" '[$api] + .')
+            local all_rules=$(echo "$routing_rules" | jq --argjson defaults "$default_rules" '$defaults + .')
             local tmp=$(mktemp)
             jq --argjson rules "$all_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
         else
-            # 即使没有其他规则，也要添加 API 规则
+            # 即使没有其他规则，也要添加默认规则
             local tmp=$(mktemp)
-            jq '.routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq --argjson rules "$default_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
         fi
 
         # 检查是否使用了leastPing或leastLoad策略,添加burstObservatory配置
@@ -3095,7 +3253,7 @@ generate_xray_config() {
     else
         # 无全局分流规则时，仍然需要检查用户级路由规则和负载均衡器
         local user_routing_rules=$(gen_xray_user_routing_rules)
-        local user_outbounds="[$direct_outbound]"
+        local user_outbounds="[$direct_outbound, {\"protocol\": \"blackhole\", \"tag\": \"block\"}, {\"protocol\": \"blackhole\", \"tag\": \"blocked\"}]"
         local user_balancers="[]"
         
         if [[ -n "$user_routing_rules" && "$user_routing_rules" != "[]" ]]; then
@@ -3150,9 +3308,13 @@ generate_xray_config() {
                 esac
             done
             
-            # 添加 API 规则到用户路由规则前面
-            local api_rule='{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}'
-            local all_rules=$(echo "$user_routing_rules" | jq --argjson api "$api_rule" '[$api] + .')
+            # 添加默认拦截规则（API + 私有 IP + BitTorrent）到用户路由规则前面
+            local default_rules='[
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+            ]'
+            local all_rules=$(echo "$user_routing_rules" | jq --argjson defaults "$default_rules" '$defaults + .')
             
             # 添加 api outbound
             user_outbounds=$(echo "$user_outbounds" | jq '. + [{protocol: "blackhole", tag: "api"}]')
@@ -3182,7 +3344,7 @@ generate_xray_config() {
             if [[ -n "$ip_routing_outbounds" && "$ip_routing_outbounds" != "[]" ]]; then
                 # 有多IP路由，生成包含多IP路由 outbound 的配置
                 # routing 规则将在 inbound 添加完成后统一添加
-                local all_outbounds=$(echo "[$direct_outbound]" | jq --argjson ip_outs "$ip_routing_outbounds" '. + $ip_outs + [{protocol: "blackhole", tag: "api"}]')
+                local all_outbounds=$(echo "[$direct_outbound, {\"protocol\": \"blackhole\", \"tag\": \"block\"}, {\"protocol\": \"blackhole\", \"tag\": \"blocked\"}]" | jq --argjson ip_outs "$ip_routing_outbounds" '. + $ip_outs + [{protocol: "blackhole", tag: "api"}]')
                 
                 jq -n --argjson outbounds "$all_outbounds" '{
                     log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
@@ -3191,18 +3353,29 @@ generate_xray_config() {
                     policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
                     inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                     outbounds: $outbounds,
-                    routing: {domainStrategy: "IPIfNonMatch", rules: [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
+                    routing: {domainStrategy: "IPIfNonMatch", rules: [
+                        {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                        {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+                        {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+                    ]}
                 }' > "$CFG/config.json"
             else
-                # 无任何路由规则，使用简单直连配置（仍需要 API 规则）
+                # 无任何路由规则，使用简单直连配置（仍需要 API 规则 + 默认拦截规则）
                 jq -n --argjson direct "$direct_outbound" '{
                     log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
                     api: {tag: "api", services: ["StatsService"]},
                     stats: {},
                     policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
                     inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
-                    outbounds: [$direct, {protocol: "blackhole", tag: "api"}],
-                    routing: {domainStrategy: "IPIfNonMatch", rules: [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
+                    outbounds: [$direct,
+                        {protocol: "blackhole", tag: "block"},
+                        {protocol: "blackhole", tag: "blocked"},
+                        {protocol: "blackhole", tag: "api"}],
+                    routing: {domainStrategy: "IPIfNonMatch", rules: [
+                        {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                        {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+                        {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+                    ]}
                 }' > "$CFG/config.json"
             fi
         fi
@@ -8744,6 +8917,25 @@ generate_singbox_config() {
                 has_routing=true
             fi
         fi
+    fi
+    
+    # 默认拦截（无条件生效）：私有 IP 段与 BitTorrent 协议一律走 block。
+    # 放在 WARP 保护规则之后、用户规则之前；sing-box 无 geoip:private，直接列出私网 CIDR。
+    if ! echo "$routing_rules" | jq -e 'any(.outbound == "block" and (.protocol // []) == ["bittorrent"])' >/dev/null 2>&1; then
+        local sb_default_block_rules='[
+            {"action": "route", "outbound": "block", "ip_cidr": [
+                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
+                "fc00::/7", "fe80::/10"
+            ]},
+            {"action": "route", "outbound": "block", "protocol": ["bittorrent"]}
+        ]'
+        if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
+            routing_rules=$(echo "$routing_rules" | jq --argjson block_rules "$sb_default_block_rules" '. + $block_rules')
+        else
+            routing_rules="$sb_default_block_rules"
+        fi
+        has_routing=true
     fi
     
     # 构建基础配置
@@ -24683,8 +24875,15 @@ do_update() {
         fi
         
         _ok "更新成功! v${VERSION} -> v${remote_ver}"
+        _info "正在自动重新生成配置并重启服务以使新版本生效..."
+        
+        # 自动初始化数据库并重构/应用配置
+        init_db 2>/dev/null
+        rebuild_and_reload_xray "silent" 2>/dev/null
+        rebuild_and_reload_singbox "silent" 2>/dev/null
+        
         echo ""
-        echo -e "  ${C}请重新运行脚本以使用新版本${NC}"
+        echo -e "  ${G}✓ 升级完成，配置已自动生成并生效！${NC}"
         echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
         _line
         exit 0
